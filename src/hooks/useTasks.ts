@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import { Task, CreateTaskInput, UpdateTaskInput, StorageStatus } from '../types/task';
 import { loadTasksFromStorage, saveTasksToStorage } from '../storage/taskStorage';
 import { generateId } from '../utils/id';
+import { enqueueMutation } from '../services/outboxService';
+import { triggerSync } from '../services/syncService';
 
 export function useTasks(onTaskActionSuccess?: () => void) {
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -44,6 +46,18 @@ export function useTasks(onTaskActionSuccess?: () => void) {
       };
 
       saveAndSetTasks((prev) => [newTask, ...prev]);
+
+      try {
+        enqueueMutation('tasks', newTask.id, 'INSERT', {
+          title: newTask.title,
+          status: 'pending',
+          priority: 'medium',
+        }, 0);
+        triggerSync().catch(() => {});
+      } catch {
+        // Safe outbox error fallback: local tasks remain intact
+      }
+
       onTaskActionSuccess?.();
       return true;
     },
@@ -80,6 +94,20 @@ export function useTasks(onTaskActionSuccess?: () => void) {
       };
 
       saveAndSetTasks((prev) => [newTask, ...prev]);
+
+      try {
+        enqueueMutation('tasks', newTask.id, 'INSERT', {
+          title: newTask.title,
+          notes: newTask.description || null,
+          priority: newTask.priority,
+          status: 'pending',
+          due_date: newTask.dueDate || null,
+        }, 0);
+        triggerSync().catch(() => {});
+      } catch {
+        // Safe outbox error fallback
+      }
+
       onTaskActionSuccess?.();
       return true;
     },
@@ -127,6 +155,19 @@ export function useTasks(onTaskActionSuccess?: () => void) {
         })
       );
 
+      try {
+        enqueueMutation('tasks', id, 'UPDATE', {
+          ...(updates.title !== undefined ? { title: updates.title.trim() } : {}),
+          ...(updates.description !== undefined ? { notes: updates.description.trim() || null } : {}),
+          ...(updates.priority !== undefined ? { priority: updates.priority } : {}),
+          ...(updates.status !== undefined ? { status: updates.status === 'completed' ? 'completed' : 'pending' } : {}),
+          ...(updates.dueDate !== undefined ? { due_date: updates.dueDate || null } : {}),
+        }, 0);
+        triggerSync().catch(() => {});
+      } catch {
+        // Safe outbox error fallback
+      }
+
       onTaskActionSuccess?.();
       return true;
     },
@@ -136,6 +177,14 @@ export function useTasks(onTaskActionSuccess?: () => void) {
   const deleteTask = useCallback(
     (id: string) => {
       saveAndSetTasks((prev) => prev.filter((t) => t.id !== id));
+
+      try {
+        enqueueMutation('tasks', id, 'DELETE', {}, 0);
+        triggerSync().catch(() => {});
+      } catch {
+        // Safe outbox error fallback
+      }
+
       onTaskActionSuccess?.();
     },
     [saveAndSetTasks, onTaskActionSuccess]
@@ -143,10 +192,11 @@ export function useTasks(onTaskActionSuccess?: () => void) {
 
   const toggleTaskStatus = useCallback(
     (id: string) => {
+      let nextStatus: Task['status'] = 'completed';
       saveAndSetTasks((prev) =>
         prev.map((task) => {
           if (task.id !== id) return task;
-          const nextStatus: Task['status'] = task.status === 'completed' ? 'todo' : 'completed';
+          nextStatus = task.status === 'completed' ? 'todo' : 'completed';
           return {
             ...task,
             status: nextStatus,
@@ -154,6 +204,16 @@ export function useTasks(onTaskActionSuccess?: () => void) {
           };
         })
       );
+
+      try {
+        enqueueMutation('tasks', id, 'UPDATE', {
+          status: nextStatus === 'completed' ? 'completed' : 'pending',
+        }, 0);
+        triggerSync().catch(() => {});
+      } catch {
+        // Safe outbox error fallback
+      }
+
       onTaskActionSuccess?.();
     },
     [saveAndSetTasks, onTaskActionSuccess]
