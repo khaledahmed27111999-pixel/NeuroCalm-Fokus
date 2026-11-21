@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2310B981' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z'/></svg>" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="NeuroCalm & Fokus — Private, offline-first personal productivity, focus, and sleep sanctuary." />
+    <meta name="theme-color" content="#0B1120" />
+    <meta name="color-scheme" content="light dark" />
+    <title>NeuroCalm & Fokus</title>
+    <script>
+      (function() {
+        try {
+          var savedTheme = localStorage.getItem('neurocalm_theme');
+          var isDark = savedTheme === 'dark' || (!savedTheme && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (isDark) {
+            document.documentElement.classList.add('dark');
+          } else {
+            document.documentElement.classList.remove('dark');
+          }
+
+          var savedLocale = localStorage.getItem('neurocalm_locale');
+          if (savedLocale === 'ar') {
+            document.documentElement.setAttribute('lang', 'ar');
+            document.documentElement.setAttribute('dir', 'rtl');
+          } else {
+            document.documentElement.setAttribute('lang', 'en');
+            document.documentElement.setAttribute('dir', 'ltr');
+          }
+        } catch (e) {
+          // Fallback gracefully if storage access is restricted
+        }
+      })();
+    </script>
+  </head>
+  <body class="bg-calm-bg text-calm-text antialiased selection:bg-emerald-500/20 selection:text-emerald-300">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
