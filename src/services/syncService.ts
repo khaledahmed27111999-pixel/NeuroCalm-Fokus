@@ -29,7 +29,7 @@ import {
 } from './deviceService';
 import { getAuthState, subscribeAuthState } from './authService';
 import { loadTasksFromStorage, saveTasksToStorage } from '../storage/taskStorage';
-import { Task } from '../types/task';
+import { Task, TaskStatus } from '../types/task';
 
 type SyncListener = (state: SyncStatusState) => void;
 const listeners = new Set<SyncListener>();
@@ -55,6 +55,33 @@ function notifySyncListeners(): void {
 }
 
 /**
+ * Maps a cloud task status (from Supabase) to the local TaskStatus model.
+ * - 'pending' -> 'todo'
+ * - 'in_progress' -> 'in_progress'
+ * - 'completed' -> 'completed'
+ * - any other value falls back safely to 'todo'
+ */
+export function mapCloudStatusToLocal(cloudStatus: unknown, fallback: TaskStatus = 'todo'): TaskStatus {
+  if (cloudStatus === 'pending' || cloudStatus === 'todo') return 'todo';
+  if (cloudStatus === 'in_progress') return 'in_progress';
+  if (cloudStatus === 'completed') return 'completed';
+  return fallback;
+}
+
+/**
+ * Maps a local TaskStatus model to the cloud Supabase status schema.
+ * - 'todo' -> 'pending'
+ * - 'in_progress' -> 'in_progress'
+ * - 'completed' -> 'completed'
+ */
+export function mapLocalStatusToCloud(localStatus: TaskStatus | undefined): string {
+  if (localStatus === 'todo') return 'pending';
+  if (localStatus === 'in_progress') return 'in_progress';
+  if (localStatus === 'completed') return 'completed';
+  return 'pending';
+}
+
+/**
  * Applies a batch of incoming server deltas to the local domain storage.
  */
 function applyIncomingDeltasLocally(changes: SyncChangeRecord[]): void {
@@ -75,11 +102,11 @@ function applyIncomingDeltasLocally(changes: SyncChangeRecord[]): void {
           id: c.entity_id,
           title: (d.title as string) || existing?.title || 'Untitled Task',
           description: (d.notes as string) ?? (d.description as string) ?? existing?.description,
-          priority: (d.priority as any) || existing?.priority || 'medium',
-          status: (d.status as any) || existing?.status || 'todo',
+          priority: (d.priority as any) === 'low' || (d.priority as any) === 'high' ? (d.priority as any) : 'medium',
+          status: mapCloudStatusToLocal(d.status, existing?.status || 'todo'),
           dueDate: (d.due_date as string) ?? (d.dueDate as string) ?? existing?.dueDate,
-          createdAt: existing?.createdAt || Date.now(),
-          updatedAt: Date.now(),
+          createdAt: existing?.createdAt || (typeof d.created_at === 'string' ? new Date(d.created_at).getTime() : Date.now()),
+          updatedAt: typeof d.updated_at === 'string' ? new Date(d.updated_at).getTime() : Date.now(),
         };
         taskMap.set(c.entity_id, updatedTask);
       }

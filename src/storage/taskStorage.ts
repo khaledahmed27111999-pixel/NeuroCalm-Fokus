@@ -42,7 +42,12 @@ export function isValidTaskRecord(item: unknown, seenIds: Set<string>): item is 
     return false;
   }
 
-  // Status validation
+  // Status normalization & validation
+  // Safely normalize cloud/legacy 'pending' to local 'todo' without accepting arbitrary unknown strings
+  if (record.status === 'pending') {
+    record.status = 'todo';
+  }
+
   const validStatuses: TaskStatus[] = ['todo', 'in_progress', 'completed'];
   if (!validStatuses.includes(record.status as TaskStatus)) {
     return false;
@@ -96,7 +101,65 @@ export interface LoadTasksResult {
 }
 
 /**
- * Loads and validates tasks from storage with corrupted data preservation
+ * Safely inspects the backup copy and recovers valid tasks whose only discrepancy was 'pending' status.
+ * - Preserves the backup key completely intact in localStorage (no deletion, no cleanup).
+ * - Recovers only records that are strictly valid with a valid ID and non-empty title.
+ * - Does NOT overwrite newer existing records with older backup records.
+ * - Idempotent across multiple reloads.
+ */
+export function recoverTasksFromBackup(currentTaskMap: Map<string, Task>): {
+  recoveredCount: number;
+} {
+  try {
+    const rawBackup = localStorage.getItem(TASK_CORRUPTED_KEY);
+    if (!rawBackup) return { recoveredCount: 0 };
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawBackup);
+    } catch {
+      return { recoveredCount: 0 };
+    }
+
+    if (!Array.isArray(parsed)) return { recoveredCount: 0 };
+
+    let recoveredCount = 0;
+
+    for (const item of parsed) {
+      if (typeof item !== 'object' || item === null) continue;
+      const candidate = { ...item } as Record<string, unknown>;
+
+      // Normalize 'pending' to 'todo'
+      if (candidate.status === 'pending') {
+        candidate.status = 'todo';
+      }
+
+      // Strict validation: must pass all task rules (title, priority, duration, timestamps, etc.)
+      if (!isValidTaskRecord(candidate, new Set<string>())) {
+        continue;
+      }
+
+      const validCandidate = candidate as Task;
+      const existing = currentTaskMap.get(validCandidate.id);
+
+      if (!existing) {
+        currentTaskMap.set(validCandidate.id, validCandidate);
+        recoveredCount++;
+      } else if (validCandidate.updatedAt > existing.updatedAt) {
+        // Only replace if the candidate from backup is strictly newer
+        currentTaskMap.set(validCandidate.id, validCandidate);
+        recoveredCount++;
+      }
+    }
+
+    return { recoveredCount };
+  } catch {
+    return { recoveredCount: 0 };
+  }
+}
+
+/**
+ * Loads and validates tasks from storage with corrupted data preservation and safe recovery
  */
 export function loadTasksFromStorage(): LoadTasksResult {
   isLocalStorageAvailable = checkLocalStorageAvailable();
@@ -114,81 +177,72 @@ export function loadTasksFromStorage(): LoadTasksResult {
 
   try {
     const rawData = localStorage.getItem(TASK_STORAGE_KEY);
-    if (!rawData) {
-      return {
-        tasks: [],
-        status: {
-          isPersistent: true,
-          hasCorruptedDataWarning: false,
-        },
-      };
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(rawData);
-    } catch {
-      // Preserve corrupted data without deleting it
-      try {
-        localStorage.setItem(TASK_CORRUPTED_KEY, rawData);
-      } catch {
-        // Ignore backup failure
-      }
-      return {
-        tasks: [],
-        status: {
-          isPersistent: true,
-          hasCorruptedDataWarning: true,
-          errorMessage: 'Corrupted task data detected. Stored data was preserved as backup.',
-        },
-      };
-    }
-
-    if (!Array.isArray(parsed)) {
-      try {
-        localStorage.setItem(TASK_CORRUPTED_KEY, rawData);
-      } catch {
-        // Ignore backup failure
-      }
-      return {
-        tasks: [],
-        status: {
-          isPersistent: true,
-          hasCorruptedDataWarning: true,
-          errorMessage: 'Stored task structure was invalid. A backup copy has been preserved.',
-        },
-      };
-    }
-
     const seenIds = new Set<string>();
-    const validTasks: Task[] = [];
-    let hasCorruptedRecord = false;
+    const taskMap = new Map<string, Task>();
+    let hasUnrecoverableCorruptedInActive = false;
+    let didNormalizeActive = false;
 
-    for (const item of parsed) {
-      if (isValidTaskRecord(item, seenIds)) {
-        seenIds.add(item.id);
-        validTasks.push(item);
-      } else {
-        hasCorruptedRecord = true;
-      }
-    }
-
-    if (hasCorruptedRecord) {
+    if (rawData) {
+      let parsed: unknown;
       try {
-        localStorage.setItem(TASK_CORRUPTED_KEY, rawData);
+        parsed = JSON.parse(rawData);
       } catch {
-        // Ignore backup failure
+        hasUnrecoverableCorruptedInActive = true;
+        try {
+          localStorage.setItem(TASK_CORRUPTED_KEY, rawData);
+        } catch {}
+      }
+
+      if (parsed && !Array.isArray(parsed)) {
+        hasUnrecoverableCorruptedInActive = true;
+        try {
+          localStorage.setItem(TASK_CORRUPTED_KEY, rawData);
+        } catch {}
+      } else if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (typeof item === 'object' && item !== null) {
+            const rec = item as Record<string, unknown>;
+            if (rec.status === 'pending') {
+              rec.status = 'todo';
+              didNormalizeActive = true;
+            }
+          }
+          if (isValidTaskRecord(item, seenIds)) {
+            seenIds.add(item.id);
+            taskMap.set(item.id, item);
+          } else {
+            hasUnrecoverableCorruptedInActive = true;
+          }
+        }
+
+        if (hasUnrecoverableCorruptedInActive) {
+          try {
+            localStorage.setItem(TASK_CORRUPTED_KEY, rawData);
+          } catch {}
+        }
       }
     }
 
-    inMemoryTasks = [...validTasks];
+    // Safely recover valid tasks from backup if present
+    const { recoveredCount } = recoverTasksFromBackup(taskMap);
+
+    // If any tasks were normalized or recovered, sync active storage cleanly
+    if (recoveredCount > 0 || didNormalizeActive) {
+      try {
+        const consolidated = Array.from(taskMap.values());
+        localStorage.setItem(TASK_STORAGE_KEY, JSON.stringify(consolidated));
+      } catch {}
+    }
+
+    const finalTasks = Array.from(taskMap.values());
+    inMemoryTasks = [...finalTasks];
 
     return {
-      tasks: validTasks,
+      tasks: finalTasks,
       status: {
         isPersistent: true,
-        hasCorruptedDataWarning: hasCorruptedRecord,
-        errorMessage: hasCorruptedRecord
+        hasCorruptedDataWarning: hasUnrecoverableCorruptedInActive,
+        errorMessage: hasUnrecoverableCorruptedInActive
           ? 'Some stored tasks were corrupted and could not be loaded. Valid tasks were preserved.'
           : undefined,
       },

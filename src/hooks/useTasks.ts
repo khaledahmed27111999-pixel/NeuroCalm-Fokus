@@ -3,7 +3,7 @@ import { Task, CreateTaskInput, UpdateTaskInput, StorageStatus } from '../types/
 import { loadTasksFromStorage, saveTasksToStorage } from '../storage/taskStorage';
 import { generateId } from '../utils/id';
 import { enqueueMutation } from '../services/outboxService';
-import { triggerSync } from '../services/syncService';
+import { triggerSync, mapLocalStatusToCloud } from '../services/syncService';
 
 export function useTasks(onTaskActionSuccess?: () => void) {
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -50,8 +50,8 @@ export function useTasks(onTaskActionSuccess?: () => void) {
       try {
         enqueueMutation('tasks', newTask.id, 'INSERT', {
           title: newTask.title,
-          status: 'pending',
-          priority: 'medium',
+          status: mapLocalStatusToCloud(newTask.status),
+          priority: newTask.priority,
         }, 0);
         triggerSync().catch(() => {});
       } catch {
@@ -100,7 +100,7 @@ export function useTasks(onTaskActionSuccess?: () => void) {
           title: newTask.title,
           notes: newTask.description || null,
           priority: newTask.priority,
-          status: 'pending',
+          status: mapLocalStatusToCloud(newTask.status),
           due_date: newTask.dueDate || null,
         }, 0);
         triggerSync().catch(() => {});
@@ -160,7 +160,7 @@ export function useTasks(onTaskActionSuccess?: () => void) {
           ...(updates.title !== undefined ? { title: updates.title.trim() } : {}),
           ...(updates.description !== undefined ? { notes: updates.description.trim() || null } : {}),
           ...(updates.priority !== undefined ? { priority: updates.priority } : {}),
-          ...(updates.status !== undefined ? { status: updates.status === 'completed' ? 'completed' : 'pending' } : {}),
+          ...(updates.status !== undefined ? { status: mapLocalStatusToCloud(updates.status) } : {}),
           ...(updates.dueDate !== undefined ? { due_date: updates.dueDate || null } : {}),
         }, 0);
         triggerSync().catch(() => {});
@@ -207,7 +207,7 @@ export function useTasks(onTaskActionSuccess?: () => void) {
 
       try {
         enqueueMutation('tasks', id, 'UPDATE', {
-          status: nextStatus === 'completed' ? 'completed' : 'pending',
+          status: mapLocalStatusToCloud(nextStatus),
         }, 0);
         triggerSync().catch(() => {});
       } catch {
