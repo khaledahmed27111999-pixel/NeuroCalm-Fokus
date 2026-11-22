@@ -106,6 +106,15 @@ export function getActiveUserId(): string | null {
   return currentAuthState.user?.id ?? null;
 }
 
+export function setAuthStateForTesting(state: Partial<AuthState>): void {
+  isInitialized = true;
+  currentAuthState = {
+    ...currentAuthState,
+    ...state,
+  };
+  notifyListeners();
+}
+
 /**
  * Signs in with email and password.
  */

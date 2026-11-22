@@ -95,9 +95,56 @@ export function isValidTaskRecord(item: unknown, seenIds: Set<string>): item is 
   return true;
 }
 
+export interface RecoverTasksResult {
+  recoveredCount: number;
+  recoveredTaskIds: string[];
+}
+
 export interface LoadTasksResult {
   tasks: Task[];
   status: StorageStatus;
+  recoveredTaskIds: string[];
+}
+
+/**
+ * Safely inspects the backup copy without modifying, deleting, or overwriting it.
+ * Returns valid candidate tasks that originated from the backup.
+ */
+export function getBackupCandidateTasks(): Task[] {
+  try {
+    const rawBackup = localStorage.getItem(TASK_CORRUPTED_KEY);
+    if (!rawBackup) return [];
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawBackup);
+    } catch {
+      return [];
+    }
+
+    if (!Array.isArray(parsed)) return [];
+
+    const seenIds = new Set<string>();
+    const validTasks: Task[] = [];
+
+    for (const item of parsed) {
+      if (typeof item !== 'object' || item === null) continue;
+      const candidate = { ...item } as Record<string, unknown>;
+
+      if (candidate.status === 'pending') {
+        candidate.status = 'todo';
+      }
+
+      if (isValidTaskRecord(candidate, seenIds)) {
+        seenIds.add(candidate.id);
+        validTasks.push(candidate);
+      }
+    }
+
+    return validTasks;
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -105,25 +152,25 @@ export interface LoadTasksResult {
  * - Preserves the backup key completely intact in localStorage (no deletion, no cleanup).
  * - Recovers only records that are strictly valid with a valid ID and non-empty title.
  * - Does NOT overwrite newer existing records with older backup records.
+ * - Returns the exact list of recovered/matched task IDs for scoped cloud synchronization.
  * - Idempotent across multiple reloads.
  */
-export function recoverTasksFromBackup(currentTaskMap: Map<string, Task>): {
-  recoveredCount: number;
-} {
+export function recoverTasksFromBackup(currentTaskMap: Map<string, Task>): RecoverTasksResult {
   try {
     const rawBackup = localStorage.getItem(TASK_CORRUPTED_KEY);
-    if (!rawBackup) return { recoveredCount: 0 };
+    if (!rawBackup) return { recoveredCount: 0, recoveredTaskIds: [] };
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(rawBackup);
     } catch {
-      return { recoveredCount: 0 };
+      return { recoveredCount: 0, recoveredTaskIds: [] };
     }
 
-    if (!Array.isArray(parsed)) return { recoveredCount: 0 };
+    if (!Array.isArray(parsed)) return { recoveredCount: 0, recoveredTaskIds: [] };
 
     let recoveredCount = 0;
+    const recoveredTaskIds: string[] = [];
 
     for (const item of parsed) {
       if (typeof item !== 'object' || item === null) continue;
@@ -145,16 +192,21 @@ export function recoverTasksFromBackup(currentTaskMap: Map<string, Task>): {
       if (!existing) {
         currentTaskMap.set(validCandidate.id, validCandidate);
         recoveredCount++;
+        recoveredTaskIds.push(validCandidate.id);
       } else if (validCandidate.updatedAt > existing.updatedAt) {
         // Only replace if the candidate from backup is strictly newer
         currentTaskMap.set(validCandidate.id, validCandidate);
         recoveredCount++;
+        recoveredTaskIds.push(validCandidate.id);
+      } else {
+        // Candidate is valid and matches existing local task: record its ID as backup-originated
+        recoveredTaskIds.push(validCandidate.id);
       }
     }
 
-    return { recoveredCount };
+    return { recoveredCount, recoveredTaskIds };
   } catch {
-    return { recoveredCount: 0 };
+    return { recoveredCount: 0, recoveredTaskIds: [] };
   }
 }
 
@@ -172,6 +224,7 @@ export function loadTasksFromStorage(): LoadTasksResult {
         hasCorruptedDataWarning: false,
         errorMessage: 'Local storage is unavailable. Tasks are held in memory only for this session.',
       },
+      recoveredTaskIds: [],
     };
   }
 
@@ -224,7 +277,7 @@ export function loadTasksFromStorage(): LoadTasksResult {
     }
 
     // Safely recover valid tasks from backup if present
-    const { recoveredCount } = recoverTasksFromBackup(taskMap);
+    const { recoveredCount, recoveredTaskIds } = recoverTasksFromBackup(taskMap);
 
     // If any tasks were normalized or recovered, sync active storage cleanly
     if (recoveredCount > 0 || didNormalizeActive) {
@@ -246,6 +299,7 @@ export function loadTasksFromStorage(): LoadTasksResult {
           ? 'Some stored tasks were corrupted and could not be loaded. Valid tasks were preserved.'
           : undefined,
       },
+      recoveredTaskIds,
     };
   } catch (error) {
     return {
@@ -255,6 +309,7 @@ export function loadTasksFromStorage(): LoadTasksResult {
         hasCorruptedDataWarning: false,
         errorMessage: error instanceof Error ? error.message : 'Unknown storage access error',
       },
+      recoveredTaskIds: [],
     };
   }
 }

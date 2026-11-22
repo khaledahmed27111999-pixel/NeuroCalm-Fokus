@@ -13,6 +13,11 @@ import { getSupabaseEnvConfig } from '../config/env';
 let clientInstance: SupabaseClient | null = null;
 let initializationAttempted = false;
 
+export function setSupabaseClientForTesting(client: any): void {
+  clientInstance = client;
+  initializationAttempted = true;
+}
+
 /**
  * Initializes and returns the Supabase client singleton, or null if unconfigured.
  */

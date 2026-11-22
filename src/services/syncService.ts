@@ -21,6 +21,7 @@ import {
   getPendingCount,
   removeAcknowledgedMutations,
   recordMutationRetry,
+  enqueueMutation,
 } from './outboxService';
 import {
   loadDeviceCursor,
@@ -28,7 +29,11 @@ import {
   updateHostedDeviceCursor,
 } from './deviceService';
 import { getAuthState, subscribeAuthState } from './authService';
-import { loadTasksFromStorage, saveTasksToStorage } from '../storage/taskStorage';
+import {
+  loadTasksFromStorage,
+  saveTasksToStorage,
+  getBackupCandidateTasks,
+} from '../storage/taskStorage';
 import { Task, TaskStatus } from '../types/task';
 
 type SyncListener = (state: SyncStatusState) => void;
@@ -98,6 +103,13 @@ function applyIncomingDeltasLocally(changes: SyncChangeRecord[]): void {
       } else if (c.operation === 'INSERT' || c.operation === 'UPDATE') {
         const d = c.record_data;
         const existing = taskMap.get(c.entity_id);
+        const incomingUpdatedAt = typeof d.updated_at === 'string' ? new Date(d.updated_at).getTime() : Date.now();
+
+        // Safety rule: Do not replace a strictly newer local task with an older cloud delta
+        if (existing && existing.updatedAt > incomingUpdatedAt) {
+          continue;
+        }
+
         const updatedTask: Task = {
           id: c.entity_id,
           title: (d.title as string) || existing?.title || 'Untitled Task',
@@ -106,7 +118,7 @@ function applyIncomingDeltasLocally(changes: SyncChangeRecord[]): void {
           status: mapCloudStatusToLocal(d.status, existing?.status || 'todo'),
           dueDate: (d.due_date as string) ?? (d.dueDate as string) ?? existing?.dueDate,
           createdAt: existing?.createdAt || (typeof d.created_at === 'string' ? new Date(d.created_at).getTime() : Date.now()),
-          updatedAt: typeof d.updated_at === 'string' ? new Date(d.updated_at).getTime() : Date.now(),
+          updatedAt: incomingUpdatedAt,
         };
         taskMap.set(c.entity_id, updatedTask);
       }
@@ -223,10 +235,151 @@ async function pullRemoteChanges(
   return { newRev: afterRev, newSeq: afterSeq };
 }
 
+export const SYNCED_RECOVERED_STORAGE_PREFIX = 'neurocalm_synced_recovered_ids_';
+
+/**
+ * Specifically synchronizes tasks recovered from corrupted backup to Supabase.
+ * - Targets ONLY candidate tasks present in the corrupted backup.
+ * - Queries Supabase public.tasks directly under the active authenticated session (using RLS).
+ * - Avoids creating mutations if task already exists on the server or in task_conflicts.
+ * - Strictly preserves original UUIDs.
+ * - Idempotent across multiple reloads.
+ */
+export async function syncRecoveredBackupTasks(
+  userId: string
+): Promise<{ enqueuedCount: number; alreadyOnServerCount: number }> {
+  if (!userId) {
+    return { enqueuedCount: 0, alreadyOnServerCount: 0 };
+  }
+
+  const client = getSupabaseClient();
+  if (!client) {
+    return { enqueuedCount: 0, alreadyOnServerCount: 0 };
+  }
+
+  const auth = getAuthState();
+  if (!auth.isAuthenticated || !auth.user || auth.user.id !== userId) {
+    return { enqueuedCount: 0, alreadyOnServerCount: 0 };
+  }
+
+  // 1. Identify valid candidate tasks strictly from the backup that exist in active storage
+  const backupCandidates = getBackupCandidateTasks();
+  if (backupCandidates.length === 0) {
+    return { enqueuedCount: 0, alreadyOnServerCount: 0 };
+  }
+
+  const { tasks: activeTasks } = loadTasksFromStorage();
+  const activeMap = new Map(activeTasks.map((t) => [t.id, t]));
+  const candidateTasks = backupCandidates.filter((t) => activeMap.has(t.id));
+  if (candidateTasks.length === 0) {
+    return { enqueuedCount: 0, alreadyOnServerCount: 0 };
+  }
+
+  // 2. Load already synced/confirmed recovered IDs for this user
+  const syncedStorageKey = `${SYNCED_RECOVERED_STORAGE_PREFIX}${userId}`;
+  let syncedIds = new Set<string>();
+  try {
+    const raw = localStorage.getItem(syncedStorageKey);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        syncedIds = new Set(parsed);
+      }
+    }
+  } catch {}
+
+  const unverifiedCandidates = candidateTasks.filter((t) => !syncedIds.has(t.id));
+  if (unverifiedCandidates.length === 0) {
+    return { enqueuedCount: 0, alreadyOnServerCount: candidateTasks.length };
+  }
+
+  const candidateIds = unverifiedCandidates.map((t) => t.id);
+
+  // 3. Query Supabase public.tasks using the authenticated session and RLS
+  let serverExistingIds = new Set<string>();
+  try {
+    const { data, error } = await client
+      .from('tasks')
+      .select('id')
+      .in('id', candidateIds);
+
+    if (!error && Array.isArray(data)) {
+      serverExistingIds = new Set(data.map((r: any) => r.id));
+    }
+  } catch (err) {
+    console.warn('[SyncService] Failed to query existing tasks on server:', err);
+    return { enqueuedCount: 0, alreadyOnServerCount: 0 };
+  }
+
+  // Also check if any are in task_conflicts
+  let conflictExistingIds = new Set<string>();
+  try {
+    const { data: conflictData, error: conflictErr } = await client
+      .from('task_conflicts')
+      .select('task_id')
+      .in('task_id', candidateIds);
+
+    if (!conflictErr && Array.isArray(conflictData)) {
+      conflictExistingIds = new Set(conflictData.map((r: any) => r.task_id));
+    }
+  } catch {}
+
+  // 4. Inspect current Outbox to avoid duplicate mutations in flight
+  const pendingMutations = getPendingBatch(100, userId);
+  const pendingEntityIds = new Set(
+    pendingMutations.filter((m) => m.entity_type === 'tasks').map((m) => m.entity_id)
+  );
+
+  let enqueuedCount = 0;
+  let alreadyOnServerCount = 0;
+
+  for (const candidate of unverifiedCandidates) {
+    // If already on server (tasks or conflicts): mark synced, do NOT create mutation
+    if (serverExistingIds.has(candidate.id) || conflictExistingIds.has(candidate.id)) {
+      syncedIds.add(candidate.id);
+      alreadyOnServerCount++;
+      continue;
+    }
+
+    // If already in Outbox: mark in registry to avoid double queuing
+    if (pendingEntityIds.has(candidate.id)) {
+      syncedIds.add(candidate.id);
+      continue;
+    }
+
+    // Safe enqueue using original UUID
+    const currentTask = activeMap.get(candidate.id) || candidate;
+    enqueueMutation(
+      'tasks',
+      currentTask.id, // Strictly original UUID
+      'INSERT',
+      {
+        title: currentTask.title,
+        notes: currentTask.description || null,
+        priority: currentTask.priority,
+        status: mapLocalStatusToCloud(currentTask.status),
+        due_date: currentTask.dueDate || null,
+      },
+      0, // baseServerRev 0 for insert
+      userId
+    );
+    syncedIds.add(currentTask.id);
+    enqueuedCount++;
+  }
+
+  // 5. Persist updated synced IDs set
+  try {
+    localStorage.setItem(syncedStorageKey, JSON.stringify(Array.from(syncedIds)));
+  } catch {}
+
+  return { enqueuedCount, alreadyOnServerCount };
+}
+
 /**
  * Triggers an end-to-end synchronization cycle:
- * 1. Pushes pending outbox mutations via sync_apply_batch.
- * 2. Pulls remote delta feed changes via get_sync_changes.
+ * 1. Scoped reconciliation of recovered backup tasks if authenticated.
+ * 2. Pushes pending outbox mutations via sync_apply_batch.
+ * 3. Pulls remote delta feed changes via get_sync_changes.
  */
 export async function triggerSync(): Promise<{ success: boolean; error?: string }> {
   const client = getSupabaseClient();
@@ -253,6 +406,13 @@ export async function triggerSync(): Promise<{ success: boolean; error?: string 
   notifySyncListeners();
 
   try {
+    // Step 0: Scoped synchronization of recovered backup tasks if authenticated
+    try {
+      await syncRecoveredBackupTasks(auth.user.id);
+    } catch (err) {
+      console.warn('[SyncService] Scoped backup tasks sync skipped on error:', err);
+    }
+
     // Step 1: Push outbox mutations
     const { maxServerRev } = await pushOutboxBatch(client);
 
